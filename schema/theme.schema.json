@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mvxxcb/dsh-harness-os-theme/schema/theme.schema.json",
+  "title": "DSH HARNESS OS theme data",
+  "description": "One themes/*.json file is an array of theme objects. scripts/build-client.mjs merges every file in themes/ into the client bundle, and scripts/check-theme-sync.mjs enforces this schema plus the DSH contract-token coverage.",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["id", "label", "description", "colorScheme", "tokens"],
+    "properties": {
+      "id": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+        "description": "Stable machine id, must be unique across every file in themes/. Used by the client to pick the theme."
+      },
+      "label": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Human-facing name shown in the settings row."
+      },
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "description": "One-line description of the palette."
+      },
+      "colorScheme": {
+        "enum": ["light", "dark"],
+        "description": "Which host color scheme this entry is the counterpart of."
+      },
+      "tokens": {
+        "type": "object",
+        "minProperties": 1,
+        "description": "Map of CSS custom property -> { light, dark }. Every value must carry BOTH schemes, which is what the DSH theme contract requires.",
+        "propertyNames": {
+          "pattern": "^--dsw-"
+        },
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["light", "dark"],
+          "properties": {
+            "light": { "type": "string", "minLength": 1 },
+            "dark": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

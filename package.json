@@ -1,0 +1,49 @@
+{
+  "name": "dsh-harness-os-theme",
+  "version": "0.1.0",
+  "description": "HARNESS OS — warm-paper + orange console theme pack for the DeepSeek Harness Web UI (暖纸白 + 橙色强调的控制台主题包)",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "theme",
+    "skin",
+    "appearance",
+    "dsw-alias"
+  ],
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "themes",
+    "schema",
+    "docs",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "check": "node scripts/check-theme-sync.mjs",
+    "test": "node tests/smoke-client.mjs",
+    "verify": "node scripts/check-theme-sync.mjs && node tests/smoke-client.mjs"
+  }
+}

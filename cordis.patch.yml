@@ -1,0 +1,16 @@
+# dsh-harness-os-theme — bundle patch
+#
+# Composes this plugin's loader row into a profile's configuration tree.
+# Client plugins have no auto-discovery: this insert is what makes the theme
+# apply after `dsh plugin --profile <name> add dsh-harness-os-theme`.
+#
+# Deliberately NOT declared in peerDependencies: keeping the manifest free of
+# `@deepseek-ai/dsh-*` peers means DSH's start-up compatibility preflight has
+# nothing to check, so the row is never silently disabled when the host moves
+# to a newer version line. This plugin only reads stable public services
+# (`theme`, `slots`, `locale`) and writes CSS custom properties, so it has no
+# compile-time coupling to a specific host tuple.
+
+- insert:
+    - id: harness-os-theme
+      name: dsh-harness-os-theme
