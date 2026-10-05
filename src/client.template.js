@@ -2,20 +2,23 @@
 //
 // 本文件是**模板**：`scripts/build-client.mjs` 会把 themes/*.json 的数据注入到
 // 下方那个主题数据占位符，生成 `lib/client.js`。请勿直接编辑 lib/client.js
-// 里的主题数据 —— 改 themes/*.json 再跑生成器，否则 `pnpm check` 会失败。
+// 里的主题数据 —— 改 themes/*.json 再跑生成器，否则 `npm run check` 会失败。
 //
 // 注意：本注释刻意不写出占位符字面量。占位符若在注释里也出现一次，
 // 生成器的字符串替换会命中注释而不是代码（这个坑已经踩过一次）。
 //
 // 设计要点
-//   1. 纯客户端插件：只读 `theme` / `slots` / `locale` 三个公开服务，
-//      把结果写成 `document.documentElement` 上的 CSS 自定义属性。
-//   2. **启动安全优先**：整个工厂函数包在 try/catch 里。主题在启动期执行，
-//      一旦抛错可能白屏 —— 所以任何一步失败都只是「主题没生效」，绝不阻断宿主。
-//   3. 防闪烁：工厂求值时就先按上次选择应用一次（早于 React 首帧），
-//      `apply(ctx)` 里再用主题服务给出的真实 colorScheme 校正。
-//   4. 可完全撤销：停用或卸载时逐条 removeProperty，并移除装饰样式表，
-//      不给宿主留下任何残留。
+//   1. 用**官方的令牌覆盖 API**，而不是自己写内联 CSS 自定义属性：
+//        theme.overrideTokens(source, tokens) -> disposer
+//      它在活动主题之上叠一层，按 seq 顺序合成、后者逐令牌胜出，
+//      移除该层即精确恢复被覆盖的内容；tokens 形如 { "--dsw-x": { light, dark } }，
+//      由**服务自己**按当前明暗解析该用哪个值。自己写 documentElement.style
+//      虽然也能生效，但会与主题服务争抢同一批属性，且在主题切换时无法正确合成。
+//   2. 同时把两套配色 theme.register() 进注册表，于是它们会出现在 DSH 自己的
+//      外观选择器里，与内置 light/dark 并列 —— 这才是主题包该有的形态。
+//   3. **启动安全优先**：主题在启动期执行，一段抛错的代码可能白屏。工厂体内
+//      每一步都各自 try/catch，任何失败都只退化为「主题没生效」，绝不阻断宿主。
+//   4. 可完全撤销：停用时只调用覆盖层的 disposer，不给宿主留残留。
 window.__ModuleLoader__.load({
   id: 'dsh-harness-os-theme',
   factory: (require) => {
@@ -23,7 +26,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
 
-    // React 只有在渲染设置行时才需要；拿不到也不影响主题生效。
+    // React 只在渲染设置行时需要；拿不到也不影响主题注册与生效。
     var React = null;
     try { React = require('react'); } catch (e) { /* 无 react 时仅失去设置行 */ }
 
@@ -33,21 +36,70 @@ window.__ModuleLoader__.load({
 
     var SOURCE = 'dsh-harness-os-theme';
     var STORE_KEY = 'dsh-harness-os-theme:prefs';
+    var DIAG_KEY = 'dsh-harness-os-theme:last';
     var DECOR_ID = 'dsh-harness-os-theme-decor';
-
-    // 装饰层：只使用 DSH 文档化的稳定锚点（[data-slot] / [data-composer-seat]）。
-    // 锚点不存在时这些规则自然不命中，不会破坏布局。
-    var DECOR_CSS = [
-      '/* HARNESS OS — 轻量装饰层（可用设置关闭）*/',
-      ':root { --hos-radius: 10px; }',
-      /* 输入座与卡片统一一点圆角与描边，贴近参考图的「仪器面板」观感 */
-      '[data-composer-seat] { --hos-on: 1; }',
-      '[data-composer-seat] > * { border-radius: var(--hos-radius); }',
-      /* 小号说明文字用等宽，呼应控制台的 REV / 状态行 */
-      '[data-slot] [data-hos-mono], .hos-mono { font-family: var(--dsw-font-family-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); letter-spacing: .02em; }'
-    ].join('\n');
-
+    var LIGHT_ID = 'harness-os-light';
+    var DARK_ID = 'harness-os-dark';
     var DEFAULT_PREFS = { enabled: true, mode: 'auto', decor: true };
+
+    function themeById(id) {
+      for (var i = 0; i < THEMES.length; i++) if (THEMES[i].id === id) return THEMES[i];
+      return THEMES[0];
+    }
+
+    /** 把 themes/*.json 的 { light, dark } 对拍平成「按 colorScheme 取单值」的注册表形态。 */
+    function flatTokens(theme) {
+      var out = {};
+      var tokens = (theme && theme.tokens) || {};
+      for (var key in tokens) {
+        if (!Object.prototype.hasOwnProperty.call(tokens, key)) continue;
+        var pair = tokens[key] || {};
+        var value = pair[theme.colorScheme];
+        if (typeof value !== 'string' || value === '') value = pair.light || pair.dark;
+        if (typeof value === 'string' && value !== '') out[key] = value;
+      }
+      return out;
+    }
+
+    /**
+     * 按偏好合成要叠加的覆盖层。
+     *
+     * `auto` 原样下发 { light, dark }，交给主题服务按当前明暗自行解析；
+     * 显式指定 `light` / `dark` 时把两侧都填成同一个变体，从而**强制**该观感
+     * —— 这样即使宿主处于深色模式，也能看到参考图里的浅色界面。
+     */
+    function overrideLayer(prefs) {
+      var source = prefs.mode === 'light' ? themeById(LIGHT_ID)
+        : prefs.mode === 'dark' ? themeById(DARK_ID)
+          : null;
+      var out = {};
+      if (source !== null) {
+        var forced = flatTokens(source);
+        for (var key in forced) {
+          if (Object.prototype.hasOwnProperty.call(forced, key)) out[key] = { light: forced[key], dark: forced[key] };
+        }
+        return out;
+      }
+      var light = (themeById(LIGHT_ID).tokens) || {};
+      var dark = (themeById(DARK_ID).tokens) || {};
+      var seen = {};
+      for (var k in light) {
+        if (!Object.prototype.hasOwnProperty.call(light, k)) continue;
+        seen[k] = 1;
+        out[k] = {
+          light: (light[k] && light[k].light) || (dark[k] && dark[k].dark) || '',
+          dark: (dark[k] && dark[k].dark) || (light[k] && light[k].light) || ''
+        };
+      }
+      for (var k2 in dark) {
+        if (!Object.prototype.hasOwnProperty.call(dark, k2) || seen[k2]) continue;
+        out[k2] = {
+          light: (dark[k2] && dark[k2].light) || '',
+          dark: (dark[k2] && dark[k2].dark) || ''
+        };
+      }
+      return out;
+    }
 
     /** 读取本地偏好；任何异常都回落到默认值（启动安全）。 */
     function readPrefs() {
@@ -70,50 +122,21 @@ window.__ModuleLoader__.load({
       try { window.localStorage.setItem(STORE_KEY, JSON.stringify(prefs)); } catch (e) { /* 忽略 */ }
     }
 
-    function themeById(id) {
-      for (var i = 0; i < THEMES.length; i++) if (THEMES[i].id === id) return THEMES[i];
-      return THEMES[0];
-    }
-
-    /** 由偏好 + 宿主真实 colorScheme 决定实际生效的令牌集合。 */
-    function resolveTheme(prefs, hostScheme) {
-      var scheme = prefs.mode === 'auto' ? (hostScheme === 'dark' ? 'dark' : 'light') : prefs.mode;
-      return scheme === 'dark' ? themeById('harness-os-dark') : themeById('harness-os-light');
-    }
-
-    var applied = [];   // 记录我们写过的属性名，便于逐条撤销
-
-    function applyTokens(theme) {
-      if (typeof document === 'undefined' || !document.documentElement) return;
-      var root = document.documentElement;
-      var tokens = (theme && theme.tokens) || {};
-      try {
-        for (var key in tokens) {
-          if (!Object.prototype.hasOwnProperty.call(tokens, key)) continue;
-          var pair = tokens[key];
-          var value = pair ? pair.light : undefined;
-          if (value === undefined || value === null) continue;
-          root.style.setProperty(key, String(value), 'important');
-          if (applied.indexOf(key) === -1) applied.push(key);
-        }
-      } catch (e) { /* 单个属性写失败不影响其余 */ }
-    }
-
-    function clearTokens() {
-      if (typeof document === 'undefined' || !document.documentElement) return;
-      var root = document.documentElement;
-      for (var i = 0; i < applied.length; i++) {
-        try { root.style.removeProperty(applied[i]); } catch (e) { /* 忽略 */ }
-      }
-      applied = [];
-    }
+    // 装饰层：只使用 DSH 文档化的稳定锚点（[data-slot] / [data-composer-seat]）。
+    // 锚点不存在时这些规则自然不命中，不会破坏布局。
+    var DECOR_CSS = [
+      '/* HARNESS OS — 轻量装饰层（可在设置里关闭）*/',
+      ':root { --hos-radius: 10px; }',
+      '[data-composer-seat] > * { border-radius: var(--hos-radius); }',
+      '.hos-mono, [data-hos-mono] { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .02em; }'
+    ].join('\n');
 
     function applyDecor(on) {
       if (typeof document === 'undefined' || !document.head) return;
       try {
         // 按 id 查找而不是只看本地引用：客户端 HMR 会重新求值本模块，
-        // 此时本地引用归零而 DOM 里的旧 <style> 仍在 —— 只认引用会
-        // 插入第二个、且旧的永远删不掉。按 id 操作天然幂等。
+        // 此时本地引用归零而 DOM 里的旧 <style> 仍在 —— 只认引用会插入
+        // 第二个、且旧的永远删不掉。按 id 操作天然幂等。
         var existing = typeof document.getElementById === 'function' ? document.getElementById(DECOR_ID) : null;
         if (on) {
           if (existing) return;
@@ -127,75 +150,122 @@ window.__ModuleLoader__.load({
       } catch (e) { /* 装饰失败不影响令牌 */ }
     }
 
-    /** 一个入口做完「读偏好 → 解析主题 → 应用/撤销」，所有调用点共用。 */
-    function render(prefs, hostScheme) {
+    /**
+     * 把「本次实际生效了什么」回写 localStorage，供排障时从磁盘读取。
+     *
+     * 探针**必须多元素取样**：DSH 的令牌并不定义在 `<html>` 上，而在更深的
+     * 元素里。早期版本只探测 documentElement，于是"我自己写在 html 上的值
+     * 读得回来"，却误以为主题生效了 —— 实际上被里层的定义遮蔽，视觉上毫无
+     * 变化。三个取样点一起看，才能区分「没生效」与「写在错误的地方被遮蔽」。
+     */
+    function recordDiag(info) {
       try {
-        if (!prefs.enabled) { clearTokens(); applyDecor(false); return; }
-        applyTokens(resolveTheme(prefs, hostScheme));
-        applyDecor(prefs.decor !== false);
-      } catch (e) { /* 启动安全：绝不向外抛 */ }
-    }
-
-    // ── 防闪烁：工厂求值阶段先应用一次 ──────────────────────────────────
-    // 此时 theme 服务还不存在，auto 模式先用 prefers-color-scheme 近似；
-    // apply(ctx) 拿到真实 colorScheme 后会立即校正。
-    var bootPrefs = readPrefs();
-    if (bootPrefs.enabled) {
-      var guess = 'light';
-      try {
-        if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) guess = 'dark';
-      } catch (e) { /* 忽略 */ }
-      applyTokens(resolveTheme(bootPrefs, guess));
-      applyDecor(bootPrefs.decor !== false);
+        if (typeof window === 'undefined' || !window.localStorage) return;
+        var probes = {};
+        try {
+          if (typeof getComputedStyle === 'function') {
+            var targets = {
+              html: document.documentElement,
+              body: document.body,
+              root: document.getElementById('root')
+            };
+            for (var where in targets) {
+              if (!Object.prototype.hasOwnProperty.call(targets, where)) continue;
+              var el = targets[where];
+              if (!el) continue;
+              probes[where] = String(getComputedStyle(el)
+                .getPropertyValue('--dsw-alias-bg-base')).trim();
+            }
+          }
+        } catch (e) { /* 取样失败留空 */ }
+        window.localStorage.setItem(DIAG_KEY, JSON.stringify({
+          mechanism: 'theme.overrideTokens',
+          activePreference: info.preference,
+          enabled: info.enabled,
+          mode: info.mode,
+          tokensInLayer: info.tokenCount,
+          probes: probes,
+          at: new Date().toISOString()
+        }));
+      } catch (e) { /* 隐私模式等：忽略 */ }
     }
 
     // ── 设置行（设置 → 通用）────────────────────────────────────────────
     var I18N = {
       zh: {
         title: 'HARNESS OS 主题',
-        enable: '启用主题',
+        enable: '启用',
+        on: '开', off: '关',
         mode: '明暗',
-        modeAuto: '跟随宿主',
-        modeLight: '浅色',
-        modeDark: '深色',
+        modeAuto: '跟随宿主', modeLight: '强制浅色', modeDark: '强制深色',
         decor: '仪器装饰层',
-        hint: '令牌覆盖 + 轻量装饰；停用即完全还原。'
+        current: '宿主当前主题：',
+        hint: '令牌以官方 overrideTokens 层叠加；两套配色也已注册进 DSH 外观选择器。'
       },
       en: {
         title: 'HARNESS OS theme',
-        enable: 'Enable theme',
+        enable: 'Enable',
+        on: 'on', off: 'off',
         mode: 'Light / dark',
-        modeAuto: 'Follow host',
-        modeLight: 'Light',
-        modeDark: 'Dark',
+        modeAuto: 'Follow host', modeLight: 'Force light', modeDark: 'Force dark',
         decor: 'Instrument decor',
-        hint: 'Token overrides plus light decoration; disabling restores everything.'
+        current: 'Host theme: ',
+        hint: 'Tokens stack through the official overrideTokens layer; both palettes are also registered in the DSH appearance picker.'
       }
     };
-    var translate = function (key) {
-      var table = I18N.zh;
-      return (table && table[key]) || key;
-    };
+    var translate = function (key) { return (I18N.zh && I18N.zh[key]) || key; };
 
     function apply(ctx) {
       var prefs = readPrefs();
       var themeSvc = ctx.get('theme');
       var slots = ctx.get('slots');
       var locale = ctx.get('locale');
+      var layerDispose = null;
 
-      function hostScheme() {
+      function currentPreference() {
         try {
           if (themeSvc && typeof themeSvc.getTheme === 'function') {
             var snap = themeSvc.getTheme();
-            if (snap && snap.active && snap.active.colorScheme) return snap.active.colorScheme;
+            if (snap && typeof snap.preference === 'string') return snap.preference;
           }
-        } catch (e) { /* 主题服务不可用：回落 light */ }
-        return 'light';
+        } catch (e) { /* 服务不可用 */ }
+        return null;
       }
 
-      function repaint() { render(prefs, hostScheme()); }
+      /** 应用/撤销覆盖层 —— 所有调用点共用这一个入口。 */
+      function repaint() {
+        try {
+          if (layerDispose !== null) {
+            try { layerDispose(); } catch (e) { /* 已失效 */ }
+            layerDispose = null;
+          }
+          if (!prefs.enabled || !themeSvc || typeof themeSvc.overrideTokens !== 'function') {
+            // 停用即完全还原：令牌层已撤，装饰样式表也必须一并撤掉。
+            // （这里曾经漏掉 applyDecor(false)，导致"主题关了但装饰还在"。）
+            applyDecor(false);
+            recordDiag({ preference: currentPreference(), enabled: false, mode: prefs.mode, tokenCount: 0 });
+            return;
+          }
+          applyDecor(prefs.decor !== false);
+          var layer = overrideLayer(prefs);
+          layerDispose = themeSvc.overrideTokens(SOURCE, layer);
+          var count = 0;
+          for (var k in layer) if (Object.prototype.hasOwnProperty.call(layer, k)) count++;
+          recordDiag({ preference: currentPreference(), enabled: true, mode: prefs.mode, tokenCount: count });
+        } catch (e) { /* 启动安全：绝不向外抛 */ }
+      }
 
-      // 首选方案已应用，这里用真实 colorScheme 校正一次
+      // 把两套配色注册进主题注册表（重复 id 会抛，忽略即可）
+      var registered = [];
+      if (themeSvc && typeof themeSvc.register === 'function') {
+        for (var i = 0; i < THEMES.length; i++) {
+          var t = THEMES[i];
+          try {
+            registered.push(themeSvc.register({ id: t.id, colorScheme: t.colorScheme, tokens: flatTokens(t) }));
+          } catch (e) { /* 已注册 / 非法：不影响覆盖层 */ }
+        }
+      }
+
       repaint();
 
       // 双语词典：拿不到 locale 就保留中文
@@ -208,47 +278,43 @@ window.__ModuleLoader__.load({
         } catch (e) { /* 词典注册失败不影响主题 */ }
       }
 
-      // 宿主切换明暗时重新解析（auto 模式依赖它）
+      // 宿主切换主题时重画（跟随宿主 / 明暗解析都依赖它）
       var unsub = null;
       try {
-        if (themeSvc && typeof themeSvc.subscribe === 'function') {
-          unsub = themeSvc.subscribe(function () { repaint(); });
+        if (themeSvc && typeof themeSvc.on === 'function') {
+          unsub = themeSvc.on('theme/change', function () { repaint(); });
         }
       } catch (e) { /* 订阅失败：仅失去自动跟随 */ }
 
-      // 设置行渲染
       if (React && slots && typeof slots.inject === 'function' && typeof slots.register === 'function') {
         try {
           var Row = function () {
             var force = React.useState(0)[1];
             var rerender = function () { force(function (n) { return n + 1; }); };
-
             var patch = function (next) {
               prefs = Object.assign({}, prefs, next);
               writePrefs(prefs);
               repaint();
               rerender();
             };
-
             var box = { display: 'flex', flexDirection: 'column', gap: '8px', padding: '12px 0' };
             var line = { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' };
             var chip = function (active) {
               return {
-                padding: '4px 10px', cursor: 'pointer',
-                borderRadius: '999px',
+                padding: '4px 10px', cursor: 'pointer', borderRadius: '999px',
                 border: '1px solid ' + (active ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l2)'),
                 color: active ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-secondary)',
                 background: 'transparent', font: 'inherit'
               };
             };
-
+            var pref = currentPreference();
             return React.createElement('div', { style: box, 'data-hos': 'settings-row' },
               React.createElement('div', { style: line },
                 React.createElement('strong', { style: { fontWeight: 600 } }, translate('title')),
                 React.createElement('button', {
                   style: chip(prefs.enabled), type: 'button',
                   onClick: function () { patch({ enabled: !prefs.enabled }); }
-                }, translate('enable') + '：' + (prefs.enabled ? '开' : '关'))
+                }, translate('enable') + '：' + (prefs.enabled ? translate('on') : translate('off')))
               ),
               React.createElement('div', { style: line },
                 React.createElement('span', { style: { color: 'var(--dsw-alias-label-secondary)' } }, translate('mode')),
@@ -266,7 +332,8 @@ window.__ModuleLoader__.load({
                   onClick: function () { patch({ decor: prefs.decor === false }); }
                 }, translate('decor'))
               ),
-              React.createElement('div', { style: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '12px' } }, translate('hint'))
+              React.createElement('div', { style: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '12px' } },
+                translate('current') + String(pref) + ' · ' + translate('hint'))
             );
           };
 
@@ -279,11 +346,15 @@ window.__ModuleLoader__.load({
         } catch (e) { /* 设置行失败不影响主题 */ }
       }
 
-      // 卸载：还原一切
+      // 卸载：先撤覆盖层，再撤注册与装饰
       ctx.effect(function () {
         return function () {
           try { if (typeof unsub === 'function') unsub(); } catch (e) { /* 忽略 */ }
-          clearTokens();
+          try { if (layerDispose !== null) layerDispose(); } catch (e) { /* 忽略 */ }
+          layerDispose = null;
+          for (var i = 0; i < registered.length; i++) {
+            try { registered[i](); } catch (e) { /* 忽略 */ }
+          }
           applyDecor(false);
         };
       });

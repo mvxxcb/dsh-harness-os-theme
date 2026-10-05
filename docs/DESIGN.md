@@ -76,8 +76,14 @@ window.__ModuleLoader__.load({
 
 - **`factory` 是 CommonJS 风格**：靠 `require` 取运行时依赖。bundle 内不能 import 兄弟文件，这决定了主题数据必须**编译进 bundle**。
 - **`exports.inject` 是服务依赖声明**，不是 package.json 的 `dsh.client.inject`。
-- 明暗判定：`ctx.get('theme').getTheme().active.colorScheme`。
-- 应用方式：`document.documentElement.style.setProperty('--dsw-…', value, 'important')`。
+- **应用方式：`theme.overrideTokens(source, tokens)`**，其中 `tokens` 形如
+  `{ '--dsw-alias-bg-base': { light: '#efedea', dark: '#141311' } }`。
+  服务自己负责 light/dark 解析、合成顺序与撤销 —— **不要自己写
+  `documentElement.style.setProperty`**，那会被 `body` / `#root` 上的定义遮蔽
+  （见 §3.1，这是本项目最贵的一课）。
+- 让配色出现在 DSH 自己的外观选择器里：`theme.register({ id, colorScheme, tokens })`，
+  此处 `tokens` 是**单值字符串**映射（一个 colorScheme 一套），与 `overrideTokens`
+  的成对形态不同。
 - 设置行：`slots.inject('settings.general.item', () => slots.register({ name, id, order }, () => ReactElement))`。
 
 ---
@@ -97,15 +103,47 @@ lib/index.js             ← host 半：空插件，仅为满足加载器
 
 `pnpm check` 做四件事：产物逐字节比对、id 唯一性、`colorScheme` 合法性、**每个主题 14/14 契约令牌全覆盖且双值齐备**。
 
-另有 `tests/smoke-client.mjs`：用桩 `window`/`document`/React 在 Node 里**真跑一遍 `lib/client.js`**，断言注册形状、工厂阶段已应用令牌（防闪烁）、深色宿主选对深色套、设置行已注册、卸载后逐条撤销干净、以及**宿主服务全缺失时不抛错**（启动安全）。15 条断言，`npm run verify` 一把跑完。
+另有 `tests/smoke-client.mjs`：用桩 `window`/`document`/React/theme 服务在 Node 里**真跑一遍 `lib/client.js`**，断言注册形状、走的是官方 `overrideTokens` 而非内联样式、覆盖层内容与浅深成对、两套配色已注册且注册形态是单值字符串、强制浅/深色时两侧同值、**从设置行点开关的真实停用路径**能精确撤销覆盖层与装饰、`theme/change` 触发重画、以及**宿主服务全缺失时不抛错**（启动安全）。27 条断言，`npm run verify` 一把跑完。
 
-### 3.1 踩过的坑：装饰样式表按引用删除会在 HMR 后漏删
+### 3.1 踩过的坑：令牌写在 `<html>` 上会被完全遮蔽（本次最贵的一条）
+
+第一版实现是**手写内联样式**：
+
+```js
+document.documentElement.style.setProperty('--dsw-alias-bg-base', '#141311', 'important')
+```
+
+它能"成功"：诊断记录读回 `#141311`，看起来一切正常。**但界面上没有任何变化。**
+
+原因：**DSH 的 `--dsw-*` 令牌并不定义在 `<html>` 上，而在 `body` / `#root` 上。**
+自定义属性遵循继承与就近覆盖 —— 里层元素自己定义了同名属性，外层的值对这个子树**完全不起作用**，`!important` 也救不了（它只影响同元素同属性的优先级，不影响不同元素之间的遮蔽）。
+
+多元素探针把这件事钉死了：
+
+```json
+"probes": { "html": "", "body": "#141311", "root": "#141311" }
+```
+
+- 早期只探 `documentElement` → 读回我自己的值 → **误判为"已生效"**；
+- 三个取样点一起看 → 立刻区分出「写在错误的地方被遮蔽」。
+
+**正确做法**是用主题服务自己的 API：
+
+```js
+theme.overrideTokens(source, { '--dsw-alias-bg-base': { light: '#efedea', dark: '#141311' }, ... })
+```
+
+服务把层放在**它真正读取令牌的位置**，并负责 light/dark 解析与合成 —— 覆盖层不是"抢占"，而是参与正常合成，移除即精确恢复。同时 `theme.register({ id, colorScheme, tokens })` 可以把配色注册进注册表，于是它们出现在 DSH 自己的外观选择器里。
+
+**教训**：写"能读回来"不等于"生效"。诊断探针必须覆盖**令牌真正所在的元素**，否则它会给出一个自信的错误答案。
+
+### 3.2 踩过的坑：装饰样式表按引用删除会在 HMR 后漏删
 
 第一版 `applyDecor` 只维护一个本地 `decorEl` 引用，删除时靠 `decorEl.parentNode`。冒烟测试第一次跑就红了 —— 因为桩 DOM 没有自动设置 `parentNode`。但顺着查下去发现这不只是桩的问题：**客户端 HMR 会重新求值本模块**，此时本地引用归零而 DOM 里旧的 `<style>` 还在，于是会插入第二个、且旧的永远删不掉。
 
 改为**按 id 查找**（`document.getElementById`）后天然幂等：加之前先查、删之前也按 id 查。这个缺陷是测试抓出来的，不是猜出来的。
 
-### 3.1 踩过的坑：占位符出现在注释里
+### 3.3 踩过的坑：占位符出现在注释里
 
 第一版模板的头部注释里写了占位符字面量，导致 `String.replace` 命中了**注释**而不是代码：JSON 被注进注释、把注释撑破成代码（语法错误），而真正的 `var THEMES = __HOS_THEMES__` 仍是未定义标识符。
 
@@ -124,10 +162,11 @@ lib/index.js             ← host 半：空插件，仅为满足加载器
 | 措施 | 位置 |
 |---|---|
 | 工厂体内所有外部调用（`require`、`localStorage`、`matchMedia`、DOM）都各自 try/catch | `lib/client.js` |
-| `render()` 整体再包一层 try/catch，**绝不向外抛** | `render()` |
-| 拿不到 `theme`/`slots`/`locale` 时降级：主题照常生效，只少设置行/自动跟随 | `apply()` |
-| 单个令牌写失败不影响其余令牌 | `applyTokens()` |
-| 卸载时逐条 `removeProperty` 并移除装饰样式表，不留残留 | `ctx.effect` 清理函数 |
+| `repaint()` 整体再包一层 try/catch，**绝不向外抛** | `repaint()` |
+| 拿不到 `theme`/`slots`/`locale` 时降级：不再叠加覆盖层，只少设置行/自动跟随 | `apply()` |
+| 注册/覆盖层调用各自 try/catch，重复 id 或非法值只影响该步 | `apply()` |
+| 卸载时撤销覆盖层、撤销主题注册、移除装饰样式表，不留残留 | `ctx.effect` 清理函数 |
+| 停用时 `applyDecor(false)` 与撤销覆盖层一起执行，不留半开状态 | `repaint()` |
 | 不声明 `@deepseek-ai/dsh-*` peer，避免启动期预检把整行静默禁用 | `package.json` |
 
 > 最后一条值得展开：DSH 自某个版本起把 **peerDependencies 当作启动期硬约束**，范围不满足就把整个 profile 行 `row.disabled = true`，且只在 stderr 留一行 —— 表现为"插件装上了但完全没反应"。本插件只读稳定公开服务，没有版本耦合，因此**刻意不声明**这些 peer。
@@ -138,9 +177,11 @@ lib/index.js             ← host 半：空插件，仅为满足加载器
 
 主题在 `apply(ctx)` 里应用时，React 首帧可能已经画完，会出现一瞬原色。
 
-对策：**在 `factory` 求值阶段就先应用一次**（此时早于首帧），用 `localStorage` 里上次的选择；`auto` 模式下先用 `prefers-color-scheme` 近似，等 `theme` 服务可用后再用真实 `colorScheme` 校正。
+对策曾经是"在 `factory` 求值阶段先写一次内联样式" —— 但那条路已经被 §3.1 证伪（写在 `<html>` 上会被遮蔽，等于没写）。
 
-首次安装仍可能有一次闪烁（本地还没有任何偏好）—— 这是纯客户端方案的理论下限，除非把偏好搬到 host 侧做启动注入。
+改用 `overrideTokens` 之后，防闪烁的形态也变了：**覆盖层必须经主题服务下落，不能抢跑**，所以现在接受这一帧的存在。实际影响很小：DSH 在页面启动时就会应用基础主题（内置 light/dark），我们的层紧随其后合成；宿主切主题时 `theme/change` 会让我们重画。
+
+如果将来确实要消除这一帧，正确方向不是再回到内联样式，而是把"该用哪套配色"提前到 host 侧、经 index 注入的 `global` 行在首帧前送达 —— 但那样就得把偏好从浏览器 `localStorage` 搬到 profile，牺牲"每浏览器独立"。当前选择是保留每浏览器偏好，接受可能的单帧原色。
 
 ---
 

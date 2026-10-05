@@ -44,9 +44,11 @@ dsh plugin --profile <your-profile> remove dsh-harness-os-theme
 
 | Control | Meaning |
 |---|---|
-| Enable theme | Master switch; turning it off restores the host's own colors |
-| Light / dark | `Follow host` / `Light` / `Dark` |
-| Instrument decor | Light decoration (card radius, etc.); when the anchors are absent the rules simply do not match |
+| Enable | Master switch; turning it off removes the override layer and the decoration, restoring the host's own colors |
+| Light / dark | `Follow host` / `Force light` / `Force dark`. **On a dark host, pick "Force light" to see the light palette** |
+| Instrument decor | Light decoration (card radius, mono hooks); when the anchors are absent the rules simply do not match |
+
+Tokens stack through **DSH's official `theme.overrideTokens()` layer** — not by writing inline styles, which land on `<html>` and get shadowed by the tokens on `body`/`#root` (see [docs/DESIGN.md](docs/DESIGN.md) §3.1). Both palettes are also registered through `theme.register()`, so they appear in **DSH's own appearance picker**.
 
 Choices are stored in the browser's `localStorage` and survive restarts.
 
